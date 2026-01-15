@@ -1,0 +1,5 @@
+{
+  "name": "MangaForge AI",
+  "description": "A comprehensive AI-powered Manga and Manhwa generator. Create unique stories, characters, and visuals referenced from real-world trends using Google Gemini.",
+  "requestFramePermissions": []
+}
