@@ -14,7 +14,8 @@ import {
   Clock,
   Play,
   AlertTriangle,
-  PauseCircle
+  PauseCircle,
+  Activity
 } from 'lucide-react';
 import { GENRES, LANGUAGES, GeneratorOptions, StoryData, GenerationStep, Character, Panel } from './types';
 import { generateStoryAndCharacters, generateImage, generateNextChapter } from './services/geminiService';
@@ -45,8 +46,12 @@ export default function App() {
 
   // Queue State
   const [imageQueue, setImageQueue] = useState<ImageTask[]>([]);
-  const [isQueueProcessing, setIsQueueProcessing] = useState(false);
   const [cooldown, setCooldown] = useState(0); // in seconds
+  
+  // Worker State
+  const MAX_IMAGE_WORKERS = 4;
+  const [activeImageWorkers, setActiveImageWorkers] = useState(0);
+  const [activeStoryWorkers, setActiveStoryWorkers] = useState(0);
 
   // References to avoid stale closures during async ops
   const storyRef = useRef<StoryData | null>(null);
@@ -72,83 +77,93 @@ export default function App() {
     }
   }, [cooldown]);
 
-  // --- QUEUE PROCESSOR ---
+  // --- WORKER POOL PROCESSOR ---
   useEffect(() => {
-    const processQueue = async () => {
-      if (isQueueProcessing || cooldown > 0 || queueRef.current.length === 0 || !storyRef.current) return;
+    // This effect runs whenever the queue changes or a worker finishes (freeing up a slot)
+    const fireWorkers = async () => {
+      // Check limits
+      if (cooldown > 0 || queueRef.current.length === 0 || activeImageWorkers >= MAX_IMAGE_WORKERS) return;
 
-      setIsQueueProcessing(true);
+      // Grab task
       const task = queueRef.current[0];
+      const newQueue = queueRef.current.slice(1);
       
-      // Determine if NSFW based on genre
-      const isAdult = storyRef.current.genre.includes('Adult') || storyRef.current.genre.includes('Hentai') || storyRef.current.genre.includes('Ecchi');
+      // Update Queue State immediately to prevent other triggers taking same task
+      queueRef.current = newQueue;
+      setImageQueue(newQueue);
 
-      try {
-        const imgUrl = await generateImage(
-          task.prompt, 
-          options.style, 
-          options.references.artRef,
-          isAdult
-        );
-
-        // Update State based on Task Type
-        const currentStory = { ...storyRef.current };
-        
-        if (task.type === 'character') {
-          const charIndex = currentStory.characters.findIndex(c => c.id === task.charId);
-          if (charIndex !== -1) {
-            const updatedChars = [...currentStory.characters];
-            updatedChars[charIndex] = { ...updatedChars[charIndex], imageUrl: imgUrl };
-            currentStory.characters = updatedChars;
-          }
-        } else if (task.type === 'panel') {
-          const chap = currentStory.chapters[task.chapterIndex];
-          if (chap) {
-             const panelIndex = chap.panels.findIndex(p => p.id === task.panelId);
-             if (panelIndex !== -1) {
-                const updatedPanels = [...chap.panels];
-                updatedPanels[panelIndex] = { ...updatedPanels[panelIndex], imageUrl: imgUrl };
-                const updatedChapters = [...currentStory.chapters];
-                updatedChapters[task.chapterIndex] = { ...chap, panels: updatedPanels };
-                currentStory.chapters = updatedChapters;
-             }
-          }
-        }
-
-        setStory(currentStory);
-        storyRef.current = currentStory;
-        saveToLibrary(currentStory);
-
-        // Remove task from queue
-        const newQueue = queueRef.current.slice(1);
-        setImageQueue(newQueue);
-        queueRef.current = newQueue;
-
-        // WAIT 4 SECONDS before next image (Throttling)
-        await new Promise(r => setTimeout(r, 4000));
-
-      } catch (err: any) {
-        console.error("Queue Error:", err);
-        // If 429 or similar, trigger LONG cooldown
-        if (err.message?.includes('429') || err.message?.includes('quota') || err.status === 429) {
-          setCooldown(30); // 30 seconds wait as requested
-        } else {
-           // Skip task on other errors to avoid block
-           const newQueue = queueRef.current.slice(1);
-           setImageQueue(newQueue);
-           queueRef.current = newQueue;
-        }
-      } finally {
-        setIsQueueProcessing(false);
-      }
+      // Start Worker
+      runImageWorker(task);
     };
 
-    // Trigger processing whenever dependencies change favorable
-    if (imageQueue.length > 0 && !isQueueProcessing && cooldown === 0) {
-      processQueue();
-    }
-  }, [imageQueue, cooldown, isQueueProcessing, options.style, options.references.artRef]);
+    fireWorkers();
+  }, [imageQueue, activeImageWorkers, cooldown]);
 
+  const runImageWorker = async (task: ImageTask) => {
+    setActiveImageWorkers(prev => prev + 1);
+    
+    try {
+      if (!storyRef.current) throw new Error("No active story");
+
+      const isAdult = storyRef.current.genre.includes('Adult') || storyRef.current.genre.includes('Hentai') || storyRef.current.genre.includes('Ecchi');
+
+      // 4000ms delay distributed randomly to prevent burst collision
+      await new Promise(r => setTimeout(r, Math.random() * 2000));
+
+      const imgUrl = await generateImage(
+        task.prompt, 
+        options.style, 
+        options.references.artRef,
+        isAdult
+      );
+
+      // Update State based on Task Type
+      // We must use functional updates or careful ref access since multiple workers update same story
+      // BUT React state updates are batched. Safe to use storyRef for "latest" data structure logic, 
+      // but we need to trigger setStory to re-render.
+      
+      const currentStory = { ...storyRef.current };
+      
+      if (task.type === 'character') {
+        const charIndex = currentStory.characters.findIndex(c => c.id === task.charId);
+        if (charIndex !== -1) {
+          const updatedChars = [...currentStory.characters];
+          updatedChars[charIndex] = { ...updatedChars[charIndex], imageUrl: imgUrl };
+          currentStory.characters = updatedChars;
+        }
+      } else if (task.type === 'panel') {
+        const chap = currentStory.chapters[task.chapterIndex];
+        if (chap) {
+            const panelIndex = chap.panels.findIndex(p => p.id === task.panelId);
+            if (panelIndex !== -1) {
+              const updatedPanels = [...chap.panels];
+              updatedPanels[panelIndex] = { ...updatedPanels[panelIndex], imageUrl: imgUrl };
+              const updatedChapters = [...currentStory.chapters];
+              updatedChapters[task.chapterIndex] = { ...chap, panels: updatedPanels };
+              currentStory.chapters = updatedChapters;
+            }
+        }
+      }
+
+      setStory(currentStory);
+      storyRef.current = currentStory;
+      saveToLibrary(currentStory);
+
+    } catch (err: any) {
+      console.error("Worker Error:", err);
+      if (err.message?.includes('429') || err.message?.includes('quota') || err.status === 429) {
+        setCooldown(30); // Hit limit, pause all workers
+        // Re-queue the failed task at the front?
+        // Ideally yes, but for simplicity we might just skip or let user re-click visualize.
+        // Let's re-queue it at the START
+        const restoredQueue = [task, ...queueRef.current];
+        queueRef.current = restoredQueue;
+        setImageQueue(restoredQueue);
+      }
+    } finally {
+      setActiveImageWorkers(prev => prev - 1);
+    }
+  };
 
   const addToQueue = (tasks: ImageTask[]) => {
     const newQueue = [...queueRef.current, ...tasks];
@@ -173,7 +188,6 @@ export default function App() {
     setStory(data);
     storyRef.current = data;
     setActiveTab('read');
-    // Clear queue when loading new story to prevent mixed up images
     setImageQueue([]);
     queueRef.current = [];
   };
@@ -198,6 +212,7 @@ export default function App() {
       setImageQueue([]);
       queueRef.current = [];
       setActiveTab('read'); 
+      setActiveStoryWorkers(prev => prev + 1);
 
       // 1. Generate Text Content (10 Chapters, 20 Characters)
       const generatedStory = await generateStoryAndCharacters(options);
@@ -207,7 +222,7 @@ export default function App() {
       // 2. Queue Initial Images
       const tasks: ImageTask[] = [];
 
-      // Queue ALL Characters (Lazy load in background)
+      // Queue ALL Characters
       generatedStory.characters.forEach(char => {
         tasks.push({
           type: 'character',
@@ -226,11 +241,9 @@ export default function App() {
           panelId: panel.id,
           prompt: `Manga Panel. Scene: ${panel.description}. Dialogue context: "${panel.dialogue}". Characters present: ${charContext}. Mood: ${options.tone}.`
         });
-        // Set placeholder immediately
         panel.imageUrl = 'loading'; 
       });
 
-      // Update story with placeholders
       setStory({ ...generatedStory });
       storyRef.current = { ...generatedStory };
       
@@ -242,6 +255,8 @@ export default function App() {
       console.error(err);
       setError("Failed to forge your story. Please try again.");
       setStep(GenerationStep.ERROR);
+    } finally {
+      setActiveStoryWorkers(prev => prev - 1);
     }
   };
 
@@ -277,6 +292,7 @@ export default function App() {
 
   const handleGenerateNextChapter = async () => {
      if (!storyRef.current) return;
+     setActiveStoryWorkers(prev => prev + 1);
      try {
        setStep(GenerationStep.GENERATING_NEXT_CHAPTER);
        const newChapter = await generateNextChapter(storyRef.current, options);
@@ -292,6 +308,8 @@ export default function App() {
      } catch (err) {
        console.error(err);
        setStep(GenerationStep.COMPLETE);
+     } finally {
+       setActiveStoryWorkers(prev => prev - 1);
      }
   };
 
@@ -328,21 +346,26 @@ export default function App() {
 
         <div className="flex items-center gap-4">
            {/* Queue Status */}
-           {imageQueue.length > 0 && (
-             <div className="flex items-center gap-2 px-3 py-1 bg-zinc-800 rounded-full border border-zinc-700 text-xs font-mono">
-               {cooldown > 0 ? (
-                 <>
-                   <PauseCircle size={12} className="text-yellow-500 animate-pulse"/>
-                   <span className="text-yellow-500">Cooling down ({cooldown}s)</span>
-                 </>
-               ) : (
-                 <>
-                   <Clock size={12} className="text-amber-500 animate-spin"/>
-                   <span className="text-zinc-400">{imageQueue.length} images queued</span>
-                 </>
-               )}
-             </div>
-           )}
+           <div className="flex items-center gap-2 px-3 py-1 bg-zinc-800 rounded-full border border-zinc-700 text-xs font-mono">
+              {cooldown > 0 ? (
+                <>
+                  <PauseCircle size={12} className="text-yellow-500 animate-pulse"/>
+                  <span className="text-yellow-500">Cooling ({cooldown}s)</span>
+                </>
+              ) : (
+                <>
+                  <Activity size={12} className={activeImageWorkers > 0 ? "text-green-500 animate-pulse" : "text-zinc-600"}/>
+                  <span className={activeImageWorkers > 0 ? "text-green-400" : "text-zinc-500"}>
+                    IMG APIs: {activeImageWorkers}/4
+                  </span>
+                  <span className="text-zinc-600">|</span>
+                  <span className={activeStoryWorkers > 0 ? "text-blue-400" : "text-zinc-500"}>
+                    TXT APIs: {activeStoryWorkers}/2
+                  </span>
+                  {imageQueue.length > 0 && <span className="text-amber-500 ml-2">({imageQueue.length} queued)</span>}
+                </>
+              )}
+           </div>
 
            {story && (
               <button onClick={() => saveToLibrary(story)} className="p-2 text-zinc-400 hover:text-amber-500 transition-colors" title="Save Progress">
